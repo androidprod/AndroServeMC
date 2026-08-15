@@ -1,0 +1,227 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+
+      release_title:
+        description: "Release title"
+        required: false
+        default: ""
+
+      prerelease:
+        description: "Pre-release"
+        required: true
+        type: boolean
+        default: false
+
+      draft:
+        description: "Draft release"
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: androservemc.exe
+            final_name: androservemc-windows-x64.exe
+
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: androservemc
+            final_name: androservemc-linux-x64
+
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary: androservemc
+            final_name: androservemc-linux-arm64
+
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            binary: androservemc
+            final_name: androservemc-macos-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cross
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            cross build --release --target "${{ matrix.target }}"
+          else
+            cargo build --release --target "${{ matrix.target }}"
+          fi
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          FILE="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+          test -f "$FILE"
+
+          ls -lh "$FILE"
+
+      - name: Strip binary
+        if: runner.os != 'Windows'
+        continue-on-error: true
+        shell: bash
+        run: |
+          strip "target/${{ matrix.target }}/release/${{ matrix.binary }}" || true
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          mv \
+            "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+            "target/${{ matrix.target }}/release/${{ matrix.final_name }}"
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: androservemc-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.final_name }}
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Test
+        run: cargo test --verbose
+
+      - name: Clippy
+        run: cargo clippy
+
+      - name: Format
+        run: cargo fmt --all
+
+  release:
+    name: Create Release
+
+    needs:
+      - build
+      - test
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        shell: bash
+        run: |
+          mkdir release
+
+          find artifacts -type f | while read file; do
+            cp "$file" release/
+          done
+
+          ls -lah release
+
+      - name: Create tag
+        shell: bash
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+
+          git tag "${{ github.event.inputs.release_tag }}"
+          git push origin "${{ github.event.inputs.release_tag }}"
+
+      - name: Generate release title
+        id: meta
+        shell: bash
+        run: |
+          TITLE="${{ github.event.inputs.release_title }}"
+
+          if [ -z "$TITLE" ]; then
+            TITLE="Release ${{ github.event.inputs.release_tag }}"
+          fi
+
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: ${{ steps.meta.outputs.title }}
+          draft: ${{ github.event.inputs.draft }}
+          prerelease: ${{ github.event.inputs.prerelease }}
+
+          files: |
+            release/*
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
